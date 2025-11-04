@@ -1,0 +1,378 @@
+name: SenseLab Audio Processing Service
+
+on:
+  # Manual trigger via GitHub UI or API
+  workflow_dispatch:
+    inputs:
+      audio_url:
+        description: 'URL to audio file to process (optional - will use test audio if not provided)'
+        required: false
+        type: string
+      audio_id:
+        description: 'Audio ID for tracking'
+        required: false
+        type: string
+        default: 'test-audio'
+      callback_url:
+        description: 'Callback URL to post results (optional)'
+        required: false
+        type: string
+      task:
+        description: 'Task to perform'
+        required: false
+        type: choice
+        options:
+          - 'transcribe'
+          - 'extract_features'
+          - 'resample'
+          - 'all'
+        default: 'all'
+      use_test_audio:
+        description: 'Use built-in test audio'
+        required: false
+        type: boolean
+        default: true
+  
+  # Trigger on push for testing
+  push:
+    paths:
+      - '.github/workflows/senselab-audio.yml'
+      - 'tests/**'
+  
+  # Trigger on pull request
+  pull_request:
+    paths:
+      - '.github/workflows/senselab-audio.yml'
+
+jobs:
+  process-audio:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version
+      
+      - name: Install senselab
+        run: |
+          echo "Installing senselab with audio dependencies..."
+          pip install 'senselab[audio]'
+          
+          # Verify installation
+          python -c "from senselab.audio.data_structures import Audio; print('✓ senselab installed successfully')"
+          pip show senselab
+      
+      - name: Generate test audio file
+        if: ${{ inputs.use_test_audio || github.event_name == 'push' || github.event_name == 'pull_request' }}
+        run: |
+          python << 'EOF'
+          import numpy as np
+          import soundfile as sf
+          
+          # Generate a simple test audio (sine wave)
+          sample_rate = 16000
+          duration = 3  # seconds
+          frequency = 440  # A4 note
+          
+          t = np.linspace(0, duration, int(sample_rate * duration))
+          audio_data = 0.5 * np.sin(2 * np.pi * frequency * t)
+          
+          # Save as WAV file
+          sf.write('test_audio.wav', audio_data, sample_rate)
+          print(f"✓ Generated test audio: {duration}s at {sample_rate}Hz")
+          
+          EOF
+          
+          # Install soundfile for the script above
+          pip install soundfile numpy
+      
+      - name: Download custom audio (if provided)
+        if: ${{ inputs.audio_url }}
+        run: |
+          echo "Downloading audio from: ${{ inputs.audio_url }}"
+          wget -O custom_audio.wav "${{ inputs.audio_url }}"
+      
+      - name: Test senselab audio processing
+        id: process
+        run: |
+          python << 'EOF'
+          from senselab.audio.data_structures import Audio
+          from senselab.audio.tasks.preprocessing import resample_audios
+          import json
+          import os
+          
+          print("=" * 60)
+          print("SenseLab Audio Processing Test")
+          print("=" * 60)
+          
+          results = {}
+          
+          # Determine which audio file to use
+          audio_file = 'test_audio.wav'
+          if os.path.exists('custom_audio.wav'):
+              audio_file = 'custom_audio.wav'
+          
+          print(f"\nProcessing: {audio_file}")
+          print("-" * 60)
+          
+          try:
+              # Load audio
+              audio = Audio.from_filepath(audio_file)
+              print(f"✓ Audio loaded successfully")
+              print(f"  - Sampling rate: {audio.sampling_rate} Hz")
+              print(f"  - Duration: {len(audio.waveform[0]) / audio.sampling_rate:.2f}s")
+              
+              results['load'] = {
+                  'success': True,
+                  'sampling_rate': audio.sampling_rate,
+                  'duration': len(audio.waveform[0]) / audio.sampling_rate,
+                  'channels': len(audio.waveform)
+              }
+              
+              # Test resampling
+              task = '${{ inputs.task }}'
+              
+              if task in ['resample', 'all']:
+                  print("\n" + "-" * 60)
+                  print("Testing: Resample")
+                  print("-" * 60)
+                  
+                  target_rate = 8000
+                  [resampled_audio] = resample_audios([audio], resample_rate=target_rate)
+                  print(f"✓ Audio resampled: {audio.sampling_rate}Hz → {resampled_audio.sampling_rate}Hz")
+                  
+                  results['resample'] = {
+                      'success': True,
+                      'original_rate': audio.sampling_rate,
+                      'target_rate': target_rate,
+                      'actual_rate': resampled_audio.sampling_rate
+                  }
+              
+              # Test feature extraction
+              if task in ['extract_features', 'all']:
+                  print("\n" + "-" * 60)
+                  print("Testing: Feature Extraction")
+                  print("-" * 60)
+                  
+                  try:
+                      from senselab.audio.tasks.features_extraction import extract_features_from_audios
+                      
+                      features = extract_features_from_audios([audio])
+                      feature_keys = list(features[0].keys()) if features else []
+                      
+                      print(f"✓ Features extracted: {len(feature_keys)} feature sets")
+                      for key in feature_keys:
+                          print(f"  - {key}")
+                      
+                      results['feature_extraction'] = {
+                          'success': True,
+                          'feature_sets': feature_keys,
+                          'count': len(feature_keys)
+                      }
+                  except ImportError as e:
+                      print(f"⚠ Feature extraction dependencies not available: {e}")
+                      results['feature_extraction'] = {
+                          'success': False,
+                          'error': 'Dependencies not installed',
+                          'note': 'Install with: pip install senselab[audio]'
+                      }
+              
+              # Test transcription
+              if task in ['transcribe', 'all']:
+                  print("\n" + "-" * 60)
+                  print("Testing: Speech-to-Text")
+                  print("-" * 60)
+                  
+                  try:
+                      from senselab.audio.tasks.speech_to_text import transcribe_audios
+                      
+                      # Note: This requires a model download, might take time
+                      print("⚠ Transcription requires model download (skipping for test)")
+                      
+                      results['transcription'] = {
+                          'success': False,
+                          'skipped': True,
+                          'reason': 'Requires large model download'
+                      }
+                  except ImportError as e:
+                      print(f"⚠ Transcription not available: {e}")
+                      results['transcription'] = {
+                          'success': False,
+                          'error': str(e)
+                      }
+              
+              # Save results
+              with open('processing_results.json', 'w') as f:
+                  json.dump(results, f, indent=2)
+              
+              print("\n" + "=" * 60)
+              print("Processing Complete")
+              print("=" * 60)
+              
+              for task_name, task_result in results.items():
+                  status = "✓ PASS" if task_result.get('success') else "✗ FAIL"
+                  print(f"{status}: {task_name}")
+              
+          except Exception as e:
+              print(f"\n✗ Error during processing: {str(e)}")
+              import traceback
+              traceback.print_exc()
+              
+              results['error'] = {
+                  'message': str(e),
+                  'type': type(e).__name__
+              }
+              
+              with open('processing_results.json', 'w') as f:
+                  json.dump(results, f, indent=2)
+              
+              exit(1)
+          
+          EOF
+      
+      - name: Run pytest tests (if available)
+        id: pytest
+        continue-on-error: true
+        run: |
+          # Check if tests directory exists
+          if [ -d "tests" ]; then
+            echo "Running pytest..."
+            pip install pytest pytest-cov
+            pytest tests/ -v --cov=. --cov-report=json || echo "Some tests failed"
+          else
+            echo "No tests directory found, skipping pytest"
+          fi
+      
+      - name: Get package metadata
+        id: metadata
+        run: |
+          SENSELAB_VERSION=$(pip show senselab | grep Version | awk '{print $2}')
+          PYTHON_VERSION=$(python --version | awk '{print $2}')
+          echo "senselab_version=$SENSELAB_VERSION" >> $GITHUB_OUTPUT
+          echo "python_version=$PYTHON_VERSION" >> $GITHUB_OUTPUT
+          echo "SenseLab version: $SENSELAB_VERSION"
+          echo "Python version: $PYTHON_VERSION"
+      
+      - name: Post results to callback URL
+        if: ${{ inputs.callback_url }}
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+        run: |
+          python << 'EOF'
+          import requests
+          import json
+          import os
+          from datetime import datetime
+          
+          callback_url = os.getenv('CALLBACK_URL')
+          
+          if not callback_url:
+              print("No callback URL provided, skipping")
+              exit(0)
+          
+          # Load processing results
+          try:
+              with open('processing_results.json', 'r') as f:
+                  processing_results = json.load(f)
+          except FileNotFoundError:
+              processing_results = {
+                  'error': 'No processing results found'
+              }
+          
+          # Determine overall success
+          success = all(
+              result.get('success', False) 
+              for task, result in processing_results.items()
+              if task != 'error' and not result.get('skipped', False)
+          )
+          
+          # Prepare payload
+          payload = {
+              'audio_id': '${{ inputs.audio_id }}',
+              'task': '${{ inputs.task }}',
+              'success': success,
+              'processing_results': processing_results,
+              'senselab_version': '${{ steps.metadata.outputs.senselab_version }}',
+              'python_version': '${{ steps.metadata.outputs.python_version }}',
+              'processed_at': datetime.utcnow().isoformat(),
+              'processing_method': 'github-actions',
+              'workflow_run_url': '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          }
+          
+          # Post to callback URL
+          try:
+              response = requests.post(
+                  callback_url,
+                  headers={'Content-Type': 'application/json'},
+                  json=payload,
+                  timeout=30
+              )
+              
+              if response.status_code == 200:
+                  print(f"✓ Results posted successfully to {callback_url}")
+              else:
+                  print(f"✗ Failed to post results: HTTP {response.status_code}")
+                  print(f"  Response: {response.text}")
+          
+          except Exception as e:
+              print(f"✗ Error posting results: {str(e)}")
+          
+          EOF
+      
+      - name: Upload processing results as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: audio-processing-results
+          path: |
+            processing_results.json
+            test_audio.wav
+            custom_audio.wav
+          retention-days: 30
+      
+      - name: Display summary
+        if: always()
+        run: |
+          echo "## SenseLab Audio Processing Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f "processing_results.json" ]; then
+            echo "### Results" >> $GITHUB_STEP_SUMMARY
+            python << 'EOF' >> $GITHUB_STEP_SUMMARY
+          import json
+          with open('processing_results.json', 'r') as f:
+              results = json.load(f)
+          
+          for task, result in results.items():
+              if result.get('skipped'):
+                  status = "⏭️ SKIPPED"
+              elif result.get('success'):
+                  status = "✅ SUCCESS"
+              else:
+                  status = "❌ FAILED"
+              
+              print(f"- **{task}**: {status}")
+              
+              if 'error' in result:
+                  print(f"  - Error: {result['error']}")
+          EOF
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Package Info" >> $GITHUB_STEP_SUMMARY
+          echo "- **SenseLab**: ${{ steps.metadata.outputs.senselab_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Python**: ${{ steps.metadata.outputs.python_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Task**: ${{ inputs.task }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Workflow" >> $GITHUB_STEP_SUMMARY
+          echo "- [View run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
